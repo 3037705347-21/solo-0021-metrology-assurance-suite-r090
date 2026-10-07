@@ -60,6 +60,8 @@ func errorStatus(err error) (int, string) {
 		return http.StatusConflict, "seal_exists"
 	case errors.Is(err, domain.ErrStateConflict):
 		return http.StatusConflict, "state_conflict"
+	case errors.Is(err, domain.ErrNotQueueHead):
+		return http.StatusConflict, "not_queue_head"
 	default:
 		return http.StatusInternalServerError, "internal_error"
 	}

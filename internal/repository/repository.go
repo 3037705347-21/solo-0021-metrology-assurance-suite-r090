@@ -104,6 +104,14 @@ func (m *Mutation) NextID(prefix string) string {
 	return fmt.Sprintf("%s-%04d", prefix, m.counters[prefix])
 }
 
+// NextCaseSequence allocates the immutable enqueue sequence for a newly
+// opened case. Sequences are monotonic across the whole repository, so queue
+// ordering never depends on map iteration.
+func (m *Mutation) NextCaseSequence() int64 {
+	m.counters["caseseq"]++
+	return int64(m.counters["caseseq"])
+}
+
 func (m *Mutation) Device(id string) (domain.Device, bool) {
 	item, ok := m.devices[id]
 	return item, ok
@@ -162,6 +170,14 @@ func (m *Mutation) ActiveCaseForDevice(deviceID string) (domain.VerificationCase
 		}
 	}
 	return domain.VerificationCase{}, false
+}
+
+func (m *Mutation) AllCases() []domain.VerificationCase {
+	result := make([]domain.VerificationCase, 0, len(m.cases))
+	for _, item := range m.cases {
+		result = append(result, item)
+	}
+	return result
 }
 
 func (m *Mutation) AppendMeasurement(item domain.Measurement) error {

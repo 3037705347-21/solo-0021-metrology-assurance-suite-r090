@@ -22,6 +22,8 @@ go run ./cmd/workflowcheck --workflow open-verification-case
 go run ./cmd/workflowcheck --workflow record-measurement
 go run ./cmd/workflowcheck --workflow reopen-verification-case
 go run ./cmd/workflowcheck --workflow seal-verification
+go run ./cmd/workflowcheck --workflow measurement-queue
+go run ./cmd/workflowcheck --workflow adjust-case-priority
 ```
 
 The workflow runner starts a fresh in-process HTTP service and exercises the
@@ -37,11 +39,23 @@ or extend these smoke checks with red/green verification tests.
 - `POST /devices`
 - `GET /devices/{id}`
 - `POST /cases`
+- `GET /cases` — current measurement queue; filter with `?device_id=` and `?batch_id=`
 - `GET /cases/{id}`
 - `POST /cases/{id}/measurements`
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
+- `POST /cases/{id}/priority`
 - `GET /cases/{id}/events`
+
+Opening a case requires `priority` (1–5, 1 is most urgent), `priority_reason`
+(the basis the responsible steward recorded), and an RFC3339
+`planned_complete_at`; `batch_id` is optional. Case reads report `overdue`
+(true for unfinished cases past their promised completion time) and
+`queue_position` (1-based, null when the case is not awaiting measurement).
+The queue orders awaiting cases by priority, then planned completion time,
+then the immutable enqueue sequence assigned at open time; rework keeps its
+original sequence. Only position 1 of that queue may record a measurement, so
+the displayed head and the case that actually enters measurement are the same.
 
 ## Layout
 

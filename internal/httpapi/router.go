@@ -25,10 +25,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /devices", s.registerDevice)
 	s.mux.HandleFunc("GET /devices/{id}", s.device)
 	s.mux.HandleFunc("POST /cases", s.openCase)
+	s.mux.HandleFunc("GET /cases", s.queue)
 	s.mux.HandleFunc("GET /cases/{id}", s.caseView)
 	s.mux.HandleFunc("POST /cases/{id}/measurements", s.recordMeasurement)
 	s.mux.HandleFunc("POST /cases/{id}/reopen", s.reopenCase)
 	s.mux.HandleFunc("POST /cases/{id}/seal", s.sealCase)
+	s.mux.HandleFunc("POST /cases/{id}/priority", s.adjustPriority)
 	s.mux.HandleFunc("GET /cases/{id}/events", s.events)
 }
 

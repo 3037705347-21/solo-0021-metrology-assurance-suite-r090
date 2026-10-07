@@ -98,6 +98,33 @@ func (s *Server) sealCase(writer http.ResponseWriter, request *http.Request) {
 	writeJSON(writer, http.StatusCreated, view)
 }
 
+func (s *Server) adjustPriority(writer http.ResponseWriter, request *http.Request) {
+	input, err := decodeJSON[contracts.AdjustPriorityRequest](writer, request)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	view, err := s.service.AdjustPriority(request.Context(), request.PathValue("id"), input)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, view)
+}
+
+func (s *Server) queue(writer http.ResponseWriter, request *http.Request) {
+	view, err := s.service.Queue(
+		request.Context(),
+		request.URL.Query().Get("device_id"),
+		request.URL.Query().Get("batch_id"),
+	)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, view)
+}
+
 func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 	view, err := s.service.Case(request.Context(), request.PathValue("id"))
 	if err != nil {

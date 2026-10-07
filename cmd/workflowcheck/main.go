@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -40,6 +39,8 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"measurement-queue":        checkMeasurementQueue,
+		"adjust-case-priority":     checkAdjustCasePriority,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -135,6 +136,13 @@ func checkOpenVerificationCase() error {
 	if state != "awaiting_measurement" {
 		return fmt.Errorf("opened case state = %q", state)
 	}
+	position, err := nestedFloat(opened.Body, "queue_position")
+	if err != nil {
+		return err
+	}
+	if position != 1 {
+		return fmt.Errorf("sole open case queue position = %v, expected 1", position)
+	}
 
 	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
 	if err != nil {
@@ -145,10 +153,13 @@ func checkOpenVerificationCase() error {
 	}
 
 	second, err := h.request(http.MethodPost, "/cases", map[string]any{
-		"device_id": deviceID,
-		"nominal":   25.0,
-		"tolerance": 0.5,
-		"steward":   "Qiao",
+		"device_id":           deviceID,
+		"nominal":             25.0,
+		"tolerance":           0.5,
+		"steward":             "Qiao",
+		"priority":            3,
+		"priority_reason":     "routine verification",
+		"planned_complete_at": futureTime(48 * time.Hour),
 	})
 	if err != nil {
 		return err
@@ -252,6 +263,25 @@ func checkReopenVerificationCase() error {
 	if err != nil {
 		return err
 	}
+	before, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(before, http.StatusOK); err != nil {
+		return err
+	}
+	originalSequence, err := nestedFloat(before.Body, "case", "enqueue_sequence")
+	if err != nil {
+		return err
+	}
+	queuedPosition, err := nestedAny(before.Body, "queue_position")
+	if err != nil {
+		return err
+	}
+	if queuedPosition != nil {
+		return fmt.Errorf("recheck case still occupies the queue: %v", queuedPosition)
+	}
+
 	reopened, err := h.request(http.MethodPost, "/cases/"+caseID+"/reopen", map[string]any{
 		"actor":  "Lin",
 		"reason": "measurement setup was replaced",
@@ -275,6 +305,20 @@ func checkReopenVerificationCase() error {
 	}
 	if len(measurements) != 1 {
 		return fmt.Errorf("reopen changed measurement history: %d entries", len(measurements))
+	}
+	returnedSequence, err := nestedFloat(reopened.Body, "case", "enqueue_sequence")
+	if err != nil {
+		return err
+	}
+	if returnedSequence != originalSequence {
+		return fmt.Errorf("reopen changed enqueue sequence: was %v, now %v", originalSequence, returnedSequence)
+	}
+	returnedPosition, err := nestedFloat(reopened.Body, "queue_position")
+	if err != nil {
+		return err
+	}
+	if returnedPosition != 1 {
+		return fmt.Errorf("reopened case queue position = %v, expected 1", returnedPosition)
 	}
 
 	second, err := h.request(http.MethodPost, "/cases/"+caseID+"/reopen", map[string]any{
@@ -375,6 +419,363 @@ func checkSealVerification() error {
 	return nil
 }
 
+func checkMeasurementQueue() error {
+	h := newHarness()
+	defer h.close()
+
+	// Two devices, two cases. The overdue case has a lower urgency rank,
+	// proving overdue status is surfaced without changing queue order.
+	overdueDevice, err := h.createDevice("MET-1501")
+	if err != nil {
+		return err
+	}
+	overdueCase, err := h.openCasePlanned(overdueDevice, "BATCH-Q1", 3, "routine calibration", futureTime(-2*time.Hour))
+	if err != nil {
+		return err
+	}
+	overdueID, err := nestedString(overdueCase.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	overdueFlag, err := nestedBool(overdueCase.Body, "overdue")
+	if err != nil {
+		return err
+	}
+	if !overdueFlag {
+		return errors.New("past planned completion case was not reported overdue")
+	}
+
+	urgentDevice, err := h.createDevice("MET-1502")
+	if err != nil {
+		return err
+	}
+	urgentCase, err := h.openCasePlanned(urgentDevice, "BATCH-Q1", 1, "customer escalated", futureTime(48*time.Hour))
+	if err != nil {
+		return err
+	}
+	urgentID, err := nestedString(urgentCase.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	urgentPosition, err := nestedFloat(urgentCase.Body, "queue_position")
+	if err != nil {
+		return err
+	}
+	if urgentPosition != 1 {
+		return fmt.Errorf("urgent case queue position = %v, expected 1", urgentPosition)
+	}
+	overdueRead, err := h.request(http.MethodGet, "/cases/"+overdueID, nil)
+	if err != nil {
+		return err
+	}
+	overduePosition, err := nestedFloat(overdueRead.Body, "queue_position")
+	if err != nil {
+		return err
+	}
+	if overduePosition != 2 {
+		return fmt.Errorf("overdue case queue position = %v, expected 2", overduePosition)
+	}
+	overdueStillFlagged, err := nestedBool(overdueRead.Body, "overdue")
+	if err != nil {
+		return err
+	}
+	if !overdueStillFlagged {
+		return errors.New("case read does not flag the overdue case")
+	}
+
+	queue, err := h.request(http.MethodGet, "/cases", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(queue, http.StatusOK); err != nil {
+		return err
+	}
+	headID, err := nestedString(queue.Body, "queue", 0, "case_id")
+	if err != nil {
+		return err
+	}
+	if headID != urgentID {
+		return fmt.Errorf("queue head = %q, expected %q", headID, urgentID)
+	}
+	secondOverdue, err := nestedBool(queue.Body, "queue", 1, "overdue")
+	if err != nil {
+		return err
+	}
+	if !secondOverdue {
+		return errors.New("queue listing does not flag the overdue case")
+	}
+
+	// A batch filter keeps global positions so the filtered head cannot
+	// disagree with the enforcement rule.
+	batch, err := h.request(http.MethodGet, "/cases?batch_id=BATCH-Q1", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(batch, http.StatusOK); err != nil {
+		return err
+	}
+	batchEntries, err := nestedSlice(batch.Body, "queue")
+	if err != nil {
+		return err
+	}
+	if len(batchEntries) != 2 {
+		return fmt.Errorf("batch filter returned %d entries", len(batchEntries))
+	}
+	secondPosition, err := nestedFloat(batch.Body, "queue", 1, "position")
+	if err != nil {
+		return err
+	}
+	if secondPosition != 2 {
+		return fmt.Errorf("filtered view rewrote global position: %v", secondPosition)
+	}
+	otherBatch, err := h.request(http.MethodGet, "/cases?batch_id=BATCH-OTHER", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(otherBatch, http.StatusOK); err != nil {
+		return err
+	}
+	empty, err := nestedSlice(otherBatch.Body, "queue")
+	if err != nil {
+		return err
+	}
+	if len(empty) != 0 {
+		return fmt.Errorf("unknown batch returned %d entries", len(empty))
+	}
+
+	// The second case in line cannot enter measurement; only the head can.
+	blocked, err := h.recordMeasurement(overdueID, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(blocked, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(blocked, "not_queue_head"); err != nil {
+		return err
+	}
+
+	measured, err := h.recordMeasurement(urgentID, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(measured, http.StatusCreated); err != nil {
+		return err
+	}
+	measuredPosition, err := nestedAny(measured.Body, "queue_position")
+	if err != nil {
+		return err
+	}
+	if measuredPosition != nil {
+		return fmt.Errorf("measured case still holds a queue position: %v", measuredPosition)
+	}
+
+	// Once the head leaves the bench the overdue case becomes head and is
+	// allowed into measurement: the displayed head and the enforced head
+	// are the same case.
+	queue, err = h.request(http.MethodGet, "/cases", nil)
+	if err != nil {
+		return err
+	}
+	newHeadID, err := nestedString(queue.Body, "queue", 0, "case_id")
+	if err != nil {
+		return err
+	}
+	if newHeadID != overdueID {
+		return fmt.Errorf("new queue head = %q, expected %q", newHeadID, overdueID)
+	}
+	nowMeasured, err := h.recordMeasurement(overdueID, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	return expectStatus(nowMeasured, http.StatusCreated)
+}
+
+func checkAdjustCasePriority() error {
+	h := newHarness()
+	defer h.close()
+
+	normalDevice, err := h.createDevice("MET-1601")
+	if err != nil {
+		return err
+	}
+	normalCase, err := h.openCasePlanned(normalDevice, "BATCH-P1", 4, "normal workload", futureTime(72*time.Hour))
+	if err != nil {
+		return err
+	}
+	normalID, err := nestedString(normalCase.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+
+	urgentDevice, err := h.createDevice("MET-1602")
+	if err != nil {
+		return err
+	}
+	urgentCase, err := h.openCasePlanned(urgentDevice, "BATCH-P1", 2, "customer escalated", futureTime(24*time.Hour))
+	if err != nil {
+		return err
+	}
+	urgentID, err := nestedString(urgentCase.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+
+	queue, err := h.request(http.MethodGet, "/cases", nil)
+	if err != nil {
+		return err
+	}
+	headID, err := nestedString(queue.Body, "queue", 0, "case_id")
+	if err != nil {
+		return err
+	}
+	if headID != urgentID {
+		return fmt.Errorf("initial queue head = %q", headID)
+	}
+
+	// Promoting the normal case above the urgent one reorders the queue and
+	// records the new basis without touching the enqueue sequence.
+	beforeSequence, err := nestedFloat(normalCase.Body, "case", "enqueue_sequence")
+	if err != nil {
+		return err
+	}
+	adjusted, err := h.request(http.MethodPost, "/cases/"+normalID+"/priority", map[string]any{
+		"priority":        1,
+		"priority_reason": "expedite: deadline moved up by the customer",
+		"actor":           "Lin",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(adjusted, http.StatusOK); err != nil {
+		return err
+	}
+	afterPriority, err := nestedFloat(adjusted.Body, "case", "priority")
+	if err != nil {
+		return err
+	}
+	if afterPriority != 1 {
+		return fmt.Errorf("adjusted priority = %v", afterPriority)
+	}
+	afterSequence, err := nestedFloat(adjusted.Body, "case", "enqueue_sequence")
+	if err != nil {
+		return err
+	}
+	if afterSequence != beforeSequence {
+		return fmt.Errorf("priority change rewrote enqueue sequence: %v -> %v", beforeSequence, afterSequence)
+	}
+	afterPosition, err := nestedFloat(adjusted.Body, "queue_position")
+	if err != nil {
+		return err
+	}
+	if afterPosition != 1 {
+		return fmt.Errorf("promoted case queue position = %v", afterPosition)
+	}
+	events, err := h.request(http.MethodGet, "/cases/"+normalID+"/events", nil)
+	if err != nil {
+		return err
+	}
+	if !hasEvent(events.Body, "priority_adjusted") {
+		return errors.New("priority_adjusted audit event is missing")
+	}
+
+	queue, err = h.request(http.MethodGet, "/cases", nil)
+	if err != nil {
+		return err
+	}
+	newHeadID, err := nestedString(queue.Body, "queue", 0, "case_id")
+	if err != nil {
+		return err
+	}
+	if newHeadID != normalID {
+		return fmt.Errorf("queue head after promotion = %q, expected %q", newHeadID, normalID)
+	}
+
+	// Invalid input and sealed history are rejected.
+	badRank, err := h.request(http.MethodPost, "/cases/"+normalID+"/priority", map[string]any{
+		"priority":        9,
+		"priority_reason": "bad rank",
+		"actor":           "Lin",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(badRank, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(badRank, "invalid_input"); err != nil {
+		return err
+	}
+	missingBasis, err := h.request(http.MethodPost, "/cases/"+normalID+"/priority", map[string]any{
+		"priority": 2,
+		"actor":    "Lin",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(missingBasis, http.StatusBadRequest); err != nil {
+		return err
+	}
+
+	// Finish and seal the urgent case. The promoted normal case is now head
+	// of the queue, so the bench processes it first; the queue head gate
+	// applies here exactly as it does in production.
+	normalMeasured, err := h.recordMeasurement(normalID, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(normalMeasured, http.StatusCreated); err != nil {
+		return err
+	}
+	urgentMeasured, err := h.recordMeasurement(urgentID, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(urgentMeasured, http.StatusCreated); err != nil {
+		return err
+	}
+	sealed, err := h.request(http.MethodPost, "/cases/"+urgentID+"/seal", map[string]any{
+		"reviewer": "Mira",
+		"summary":  "accepted measurement sealed for review",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+	reprioritizeSealed, err := h.request(http.MethodPost, "/cases/"+urgentID+"/priority", map[string]any{
+		"priority":        5,
+		"priority_reason": "attempt to rewrite finished history",
+		"actor":           "Lin",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reprioritizeSealed, http.StatusConflict); err != nil {
+		return err
+	}
+	read, err := h.request(http.MethodGet, "/cases/"+urgentID, nil)
+	if err != nil {
+		return err
+	}
+	storedPriority, err := nestedFloat(read.Body, "case", "priority")
+	if err != nil {
+		return err
+	}
+	if storedPriority != 2 {
+		return fmt.Errorf("sealed case priority changed to %v", storedPriority)
+	}
+	history, err := nestedSlice(read.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(history) != 1 {
+		return fmt.Errorf("sealed measurement history changed: %d entries", len(history))
+	}
+	return nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -441,11 +842,19 @@ func (h *harness) createDevice(tag string) (string, error) {
 }
 
 func (h *harness) openCase(deviceID string) (apiResponse, error) {
+	return h.openCasePlanned(deviceID, "", 3, "routine verification", futureTime(48*time.Hour))
+}
+
+func (h *harness) openCasePlanned(deviceID, batchID string, priority int, reason string, plannedCompleteAt string) (apiResponse, error) {
 	response, err := h.request(http.MethodPost, "/cases", map[string]any{
-		"device_id": deviceID,
-		"nominal":   25.0,
-		"tolerance": 0.5,
-		"steward":   "Qiao",
+		"device_id":           deviceID,
+		"batch_id":            batchID,
+		"nominal":             25.0,
+		"tolerance":           0.5,
+		"steward":             "Qiao",
+		"priority":            priority,
+		"priority_reason":     reason,
+		"planned_complete_at": plannedCompleteAt,
 	})
 	if err != nil {
 		return apiResponse{}, err
@@ -454,6 +863,10 @@ func (h *harness) openCase(deviceID string) (apiResponse, error) {
 		return apiResponse{}, err
 	}
 	return response, nil
+}
+
+func futureTime(offset time.Duration) string {
+	return time.Now().Add(offset).UTC().Format(time.RFC3339)
 }
 
 func (h *harness) recordMeasurement(caseID string, observed float64, technician string) (apiResponse, error) {
@@ -527,14 +940,14 @@ func expectErrorCode(response apiResponse, expected string) error {
 	return nil
 }
 
-func nestedString(root map[string]any, path ...string) (string, error) {
-	value, err := nestedValue(root, path...)
+func nestedString(root map[string]any, path ...any) (string, error) {
+	value, err := nestedAny(root, path...)
 	if err != nil {
 		return "", err
 	}
 	text, ok := value.(string)
 	if !ok {
-		return "", fmt.Errorf("%s is not a string", strings.Join(path, "."))
+		return "", fmt.Errorf("%v is not a string", path)
 	}
 	return text, nil
 }
@@ -549,6 +962,18 @@ func nestedBool(root map[string]any, path ...any) (bool, error) {
 		return false, fmt.Errorf("%v is not a boolean", path)
 	}
 	return flag, nil
+}
+
+func nestedFloat(root map[string]any, path ...any) (float64, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%v is not a number", path)
+	}
+	return number, nil
 }
 
 func nestedSlice(root map[string]any, key string) ([]any, error) {
@@ -578,14 +1003,6 @@ func hasEvent(root map[string]any, kind string) bool {
 		}
 	}
 	return false
-}
-
-func nestedValue(root map[string]any, path ...string) (any, error) {
-	parts := make([]any, 0, len(path))
-	for _, part := range path {
-		parts = append(parts, part)
-	}
-	return nestedAny(root, parts...)
 }
 
 func nestedAny(root map[string]any, path ...any) (any, error) {

@@ -1,6 +1,10 @@
 package contracts
 
-import "example.com/solo-0021-metrology-assurance-suite/internal/domain"
+import (
+	"time"
+
+	"example.com/solo-0021-metrology-assurance-suite/internal/domain"
+)
 
 type RegisterDeviceRequest struct {
 	AssetTag string `json:"asset_tag"`
@@ -10,10 +14,20 @@ type RegisterDeviceRequest struct {
 }
 
 type OpenCaseRequest struct {
-	DeviceID  string  `json:"device_id"`
-	Nominal   float64 `json:"nominal"`
-	Tolerance float64 `json:"tolerance"`
-	Steward   string  `json:"steward"`
+	DeviceID          string  `json:"device_id"`
+	BatchID           string  `json:"batch_id"`
+	Nominal           float64 `json:"nominal"`
+	Tolerance         float64 `json:"tolerance"`
+	Steward           string  `json:"steward"`
+	Priority          int     `json:"priority"`
+	PriorityReason    string  `json:"priority_reason"`
+	PlannedCompleteAt string  `json:"planned_complete_at"`
+}
+
+type AdjustPriorityRequest struct {
+	Priority       int    `json:"priority"`
+	PriorityReason string `json:"priority_reason"`
+	Actor          string `json:"actor"`
 }
 
 type RecordMeasurementRequest struct {
@@ -40,6 +54,36 @@ type CaseResponse struct {
 	Measurements []domain.Measurement    `json:"measurements"`
 	Seal         *domain.EvidenceSeal    `json:"seal,omitempty"`
 	Events       []domain.AuditEvent     `json:"events"`
+	// QueuePosition is the 1-based position in the current measurement queue
+	// and is null whenever the case is not awaiting measurement.
+	QueuePosition *int `json:"queue_position"`
+	// Overdue reports an unfinished case past its promised completion time.
+	Overdue bool `json:"overdue"`
+}
+
+// QueueEntry is one queued case as seen by the lab floor. Positions are
+// always expressed against the single global queue, even when the view was
+// narrowed by device or batch, so the first entry shown and the case allowed
+// into measurement can never disagree.
+type QueueEntry struct {
+	Position          int       `json:"position"`
+	CaseID            string    `json:"case_id"`
+	DeviceID          string    `json:"device_id"`
+	BatchID           string    `json:"batch_id,omitempty"`
+	State             string    `json:"state"`
+	Priority          int       `json:"priority"`
+	PriorityReason    string    `json:"priority_reason"`
+	Steward           string    `json:"steward"`
+	PlannedCompleteAt time.Time `json:"planned_complete_at"`
+	EnqueueSequence   int64     `json:"enqueue_sequence"`
+	Overdue           bool      `json:"overdue"`
+}
+
+type QueueResponse struct {
+	GeneratedAt time.Time    `json:"generated_at"`
+	DeviceID    string       `json:"device_id,omitempty"`
+	BatchID     string       `json:"batch_id,omitempty"`
+	Queue       []QueueEntry `json:"queue"`
 }
 
 type EventsResponse struct {
