@@ -164,6 +164,14 @@ func (m *Mutation) ActiveCaseForDevice(deviceID string) (domain.VerificationCase
 	return domain.VerificationCase{}, false
 }
 
+func (m *Mutation) AllCases() []domain.VerificationCase {
+	result := make([]domain.VerificationCase, 0, len(m.cases))
+	for _, item := range m.cases {
+		result = append(result, item)
+	}
+	return result
+}
+
 func (m *Mutation) AppendMeasurement(item domain.Measurement) error {
 	if _, exists := m.cases[item.CaseID]; !exists {
 		return fmt.Errorf("%w: case %s", domain.ErrNotFound, item.CaseID)

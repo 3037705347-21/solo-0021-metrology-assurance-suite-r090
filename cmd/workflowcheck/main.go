@@ -40,6 +40,7 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"measurement-queue":        checkMeasurementQueue,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -135,6 +136,20 @@ func checkOpenVerificationCase() error {
 	if state != "awaiting_measurement" {
 		return fmt.Errorf("opened case state = %q", state)
 	}
+	dueAt, err := nestedString(opened.Body, "case", "due_at")
+	if err != nil {
+		return err
+	}
+	if dueAt == "" {
+		return errors.New("opened case has no planned completion time")
+	}
+	priority, err := nestedString(opened.Body, "case", "priority")
+	if err != nil {
+		return err
+	}
+	if priority != "routine" {
+		return fmt.Errorf("opened case priority = %q", priority)
+	}
 
 	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
 	if err != nil {
@@ -145,10 +160,13 @@ func checkOpenVerificationCase() error {
 	}
 
 	second, err := h.request(http.MethodPost, "/cases", map[string]any{
-		"device_id": deviceID,
-		"nominal":   25.0,
-		"tolerance": 0.5,
-		"steward":   "Qiao",
+		"device_id":       deviceID,
+		"nominal":         25.0,
+		"tolerance":       0.5,
+		"steward":         "Qiao",
+		"due_at":          time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339),
+		"priority":        "routine",
+		"priority_reason": "standard verification plan",
 	})
 	if err != nil {
 		return err
@@ -375,6 +393,281 @@ func checkSealVerification() error {
 	return nil
 }
 
+func checkMeasurementQueue() error {
+	h := newHarness()
+	defer h.close()
+
+	// Case A: routine priority, due in 24h. Case B: urgent, due in 48h.
+	deviceA, err := h.createDevice("MET-1501")
+	if err != nil {
+		return err
+	}
+	dueA := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
+	caseA, err := h.openCaseWithSchedule(deviceA, dueA, "routine", "routine calibration round")
+	if err != nil {
+		return err
+	}
+	deviceB, err := h.createDevice("MET-1502")
+	if err != nil {
+		return err
+	}
+	caseB, err := h.openCaseWithSchedule(deviceB, time.Now().UTC().Add(48*time.Hour), "urgent", "customer audit deadline")
+	if err != nil {
+		return err
+	}
+
+	// The urgent case leads the queue even though it was opened second.
+	if err := h.expectQueueOrder(caseB, caseA); err != nil {
+		return err
+	}
+
+	// Only the queue head may enter measurement.
+	blocked, err := h.recordMeasurement(caseA, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(blocked, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(blocked, "queue_head_mismatch"); err != nil {
+		return err
+	}
+
+	readB, err := h.request(http.MethodGet, "/cases/"+caseB, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(readB, http.StatusOK); err != nil {
+		return err
+	}
+	if err := expectQueueView(readB.Body, 1, 2, false); err != nil {
+		return fmt.Errorf("case B queue view: %w", err)
+	}
+
+	// Case C is registered with an already-past planned completion time.
+	deviceC, err := h.createDevice("MET-1503")
+	if err != nil {
+		return err
+	}
+	caseC, err := h.openCaseWithSchedule(deviceC, time.Now().UTC().Add(-1*time.Hour), "routine", "late intake")
+	if err != nil {
+		return err
+	}
+	readC, err := h.request(http.MethodGet, "/cases/"+caseC, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(readC, http.StatusOK); err != nil {
+		return err
+	}
+	if err := expectQueueView(readC.Body, 2, 3, true); err != nil {
+		return fmt.Errorf("case C queue view: %w", err)
+	}
+
+	// Raising case A to urgent makes it the head because its planned
+	// completion time is earlier than case B's.
+	adjusted, err := h.request(http.MethodPost, "/cases/"+caseA+"/priority", map[string]any{
+		"actor":    "Lin",
+		"priority": "urgent",
+		"reason":   "customer moved audit forward",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(adjusted, http.StatusOK); err != nil {
+		return err
+	}
+	priority, err := nestedString(adjusted.Body, "case", "priority")
+	if err != nil {
+		return err
+	}
+	if priority != "urgent" {
+		return fmt.Errorf("adjusted priority = %q", priority)
+	}
+	reason, err := nestedString(adjusted.Body, "case", "priority_reason")
+	if err != nil {
+		return err
+	}
+	if reason != "customer moved audit forward" {
+		return fmt.Errorf("adjusted priority reason = %q", reason)
+	}
+	version, err := nestedFloat(adjusted.Body, "case", "version")
+	if err != nil {
+		return err
+	}
+	if version != 2 {
+		return fmt.Errorf("adjusted case version = %v, expected 2", version)
+	}
+	// The adjustment must not rewrite the registered planned completion time.
+	dueAt, err := nestedString(adjusted.Body, "case", "due_at")
+	if err != nil {
+		return err
+	}
+	if dueAt != dueA.Format(time.RFC3339) {
+		return fmt.Errorf("adjustment changed planned completion time: %q", dueAt)
+	}
+	if !hasEvent(adjusted.Body, "case_opened") || !hasEvent(adjusted.Body, "case_priority_adjusted") {
+		return errors.New("priority adjustment did not preserve the audit trail")
+	}
+	if err := h.expectQueueOrder(caseA, caseB, caseC); err != nil {
+		return err
+	}
+
+	// Measuring the head removes it from the queue; sealing keeps history.
+	measuredA, err := h.recordMeasurement(caseA, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(measuredA, http.StatusCreated); err != nil {
+		return err
+	}
+	if err := h.expectQueueOrder(caseB, caseC); err != nil {
+		return err
+	}
+	sealedA, err := h.request(http.MethodPost, "/cases/"+caseA+"/seal", map[string]any{
+		"reviewer": "Reviewer-1",
+		"summary":  "accepted measurement sealed for review",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealedA, http.StatusCreated); err != nil {
+		return err
+	}
+	if err := expectQueueView(sealedA.Body, 0, 2, false); err != nil {
+		return fmt.Errorf("sealed case A queue view: %w", err)
+	}
+	sealedAdjust, err := h.request(http.MethodPost, "/cases/"+caseA+"/priority", map[string]any{
+		"actor":    "Lin",
+		"priority": "routine",
+		"reason":   "attempt to rewrite a sealed case",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealedAdjust, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(sealedAdjust, "state_conflict"); err != nil {
+		return err
+	}
+
+	// A rejected measurement takes case B out of the queue; reopening brings
+	// it back at the deterministic position without erasing the failed record.
+	rejectedB, err := h.recordMeasurement(caseB, 26.5, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(rejectedB, http.StatusCreated); err != nil {
+		return err
+	}
+	if err := h.expectQueueOrder(caseC); err != nil {
+		return err
+	}
+	reopenedB, err := h.request(http.MethodPost, "/cases/"+caseB+"/reopen", map[string]any{
+		"actor":  "Lin",
+		"reason": "measurement setup was replaced",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopenedB, http.StatusOK); err != nil {
+		return err
+	}
+	measurementsB, err := nestedSlice(reopenedB.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(measurementsB) != 1 {
+		return fmt.Errorf("reopen changed measurement history: %d entries", len(measurementsB))
+	}
+	if err := h.expectQueueOrder(caseB, caseC); err != nil {
+		return err
+	}
+
+	// Both remaining cases are measured in queue order; the queue drains.
+	acceptedB, err := h.recordMeasurement(caseB, 25.2, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(acceptedB, http.StatusCreated); err != nil {
+		return err
+	}
+	acceptedC, err := h.recordMeasurement(caseC, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(acceptedC, http.StatusCreated); err != nil {
+		return err
+	}
+	return h.expectQueueOrder()
+}
+
+func (h *harness) expectQueueOrder(expected ...string) error {
+	response, err := h.request(http.MethodGet, "/cases/queue", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(response, http.StatusOK); err != nil {
+		return err
+	}
+	entries, err := nestedSlice(response.Body, "entries")
+	if err != nil {
+		return err
+	}
+	if len(entries) != len(expected) {
+		return fmt.Errorf("queue has %d entries, expected %d: %s", len(entries), len(expected), response.Raw)
+	}
+	for index, caseID := range expected {
+		position, err := nestedFloat(entries[index].(map[string]any), "position")
+		if err != nil {
+			return err
+		}
+		if position != float64(index+1) {
+			return fmt.Errorf("queue entry %d position = %v", index, position)
+		}
+		id, err := nestedString(entries[index].(map[string]any), "case", "id")
+		if err != nil {
+			return err
+		}
+		if id != caseID {
+			return fmt.Errorf("queue entry %d = %q, expected %q", index, id, caseID)
+		}
+	}
+	return nil
+}
+
+func expectQueueView(body map[string]any, position, size int, overdue bool) error {
+	value, err := nestedBool(body, "queue", "overdue")
+	if err != nil {
+		return err
+	}
+	if value != overdue {
+		return fmt.Errorf("overdue = %v, expected %v", value, overdue)
+	}
+	actualSize, err := nestedFloat(body, "queue", "size")
+	if err != nil {
+		return err
+	}
+	if actualSize != float64(size) {
+		return fmt.Errorf("queue size = %v, expected %d", actualSize, size)
+	}
+	actualPosition, err := nestedFloat(body, "queue", "position")
+	if position == 0 {
+		if err == nil {
+			return fmt.Errorf("queue position = %v, expected none", actualPosition)
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if actualPosition != float64(position) {
+		return fmt.Errorf("queue position = %v, expected %d", actualPosition, position)
+	}
+	return nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -441,12 +734,36 @@ func (h *harness) createDevice(tag string) (string, error) {
 }
 
 func (h *harness) openCase(deviceID string) (apiResponse, error) {
-	response, err := h.request(http.MethodPost, "/cases", map[string]any{
+	return h.openCaseWith(deviceID, map[string]any{
+		"due_at":          time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339),
+		"priority":        "routine",
+		"priority_reason": "standard verification plan",
+	})
+}
+
+func (h *harness) openCaseWithSchedule(deviceID string, dueAt time.Time, priority, reason string) (string, error) {
+	response, err := h.openCaseWith(deviceID, map[string]any{
+		"due_at":          dueAt.UTC().Format(time.RFC3339),
+		"priority":        priority,
+		"priority_reason": reason,
+	})
+	if err != nil {
+		return "", err
+	}
+	return nestedString(response.Body, "case", "id")
+}
+
+func (h *harness) openCaseWith(deviceID string, schedule map[string]any) (apiResponse, error) {
+	body := map[string]any{
 		"device_id": deviceID,
 		"nominal":   25.0,
 		"tolerance": 0.5,
 		"steward":   "Qiao",
-	})
+	}
+	for key, value := range schedule {
+		body[key] = value
+	}
+	response, err := h.request(http.MethodPost, "/cases", body)
 	if err != nil {
 		return apiResponse{}, err
 	}
@@ -537,6 +854,18 @@ func nestedString(root map[string]any, path ...string) (string, error) {
 		return "", fmt.Errorf("%s is not a string", strings.Join(path, "."))
 	}
 	return text, nil
+}
+
+func nestedFloat(root map[string]any, path ...string) (float64, error) {
+	value, err := nestedValue(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%s is not a number", strings.Join(path, "."))
+	}
+	return number, nil
 }
 
 func nestedBool(root map[string]any, path ...any) (bool, error) {

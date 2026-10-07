@@ -79,7 +79,11 @@ func (s *Service) Device(ctx context.Context, id string) (domain.Device, error) 
 
 func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest) (contracts.CaseResponse, error) {
 	var result contracts.CaseResponse
-	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+	priority, err := domain.ParseCasePriority(input.Priority)
+	if err != nil {
+		return result, err
+	}
+	err = s.repository.Mutate(ctx, func(m *repository.Mutation) error {
 		deviceID := strings.TrimSpace(input.DeviceID)
 		device, exists := m.Device(deviceID)
 		if !exists {
@@ -97,6 +101,9 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 			input.Nominal,
 			input.Tolerance,
 			input.Steward,
+			input.DueAt,
+			priority,
+			input.PriorityReason,
 			s.now(),
 		)
 		if err != nil {
@@ -112,14 +119,19 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 			item.ID,
 			"case_opened",
 			item.Steward,
-			"verification case opened",
+			fmt.Sprintf(
+				"verification case opened with priority %s (%s), planned completion %s",
+				item.Priority,
+				item.PriorityReason,
+				item.DueAt.Format(time.RFC3339),
+			),
 			s.now(),
 		)
 		if err != nil {
 			return err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
+		result = s.caseResponse(m, item)
 		return nil
 	})
 	return result, err
@@ -132,7 +144,29 @@ func (s *Service) Case(ctx context.Context, id string) (contracts.CaseResponse, 
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
-		result = caseResponseFromSnapshot(snapshot, item)
+		result = s.caseResponseFromSnapshot(snapshot, item)
+		return nil
+	})
+	return result, err
+}
+
+func (s *Service) MeasurementQueue(ctx context.Context) (contracts.QueueResponse, error) {
+	var result contracts.QueueResponse
+	err := s.repository.Read(ctx, func(snapshot repository.Snapshot) error {
+		now := s.now()
+		queue := domain.MeasurementQueue(snapshot.AllCases())
+		entries := make([]contracts.QueueEntry, 0, len(queue))
+		for index, item := range queue {
+			entries = append(entries, contracts.QueueEntry{
+				Position: index + 1,
+				Overdue:  item.IsOverdue(now),
+				Case:     item,
+			})
+		}
+		result = contracts.QueueResponse{
+			GeneratedAt: now.UTC(),
+			Entries:     entries,
+		}
 		return nil
 	})
 	return result, err
@@ -156,6 +190,12 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 			s.now(),
 		)
 		if err != nil {
+			return err
+		}
+		if item.State != domain.CaseAwaitingMeasurement {
+			return fmt.Errorf("%w: case is not awaiting measurement", domain.ErrStateConflict)
+		}
+		if err := checkQueueHead(m, item); err != nil {
 			return err
 		}
 		if err := item.RecordMeasurement(measurement.Accepted, s.now()); err != nil {
@@ -187,10 +227,24 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 			return err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
+		result = s.caseResponse(m, item)
 		return nil
 	})
 	return result, err
+}
+
+// checkQueueHead enforces that the case entering measurement is the current
+// head of the derived measurement queue, so the published order matches what
+// actually reaches the bench.
+func checkQueueHead(m *repository.Mutation, item domain.VerificationCase) error {
+	queue := domain.MeasurementQueue(m.AllCases())
+	if len(queue) == 0 {
+		return fmt.Errorf("%w: case %s is not in the measurement queue", domain.ErrQueueHeadMismatch, item.ID)
+	}
+	if queue[0].ID != item.ID {
+		return fmt.Errorf("%w: case %s must be measured before case %s", domain.ErrQueueHeadMismatch, queue[0].ID, item.ID)
+	}
+	return nil
 }
 
 func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts.ReopenCaseRequest) (contracts.CaseResponse, error) {
@@ -226,7 +280,51 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 			return err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
+		result = s.caseResponse(m, item)
+		return nil
+	})
+	return result, err
+}
+
+func (s *Service) AdjustCasePriority(ctx context.Context, caseID string, input contracts.AdjustCasePriorityRequest) (contracts.CaseResponse, error) {
+	var result contracts.CaseResponse
+	priority, err := domain.ParseCasePriority(input.Priority)
+	if err != nil {
+		return result, err
+	}
+	err = s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		id := strings.TrimSpace(caseID)
+		item, exists := m.Case(id)
+		if !exists {
+			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+		}
+		actor := strings.TrimSpace(input.Actor)
+		reason := strings.TrimSpace(input.Reason)
+		if actor == "" || reason == "" {
+			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
+		}
+		previous := item.Priority
+		if err := item.AdjustPriority(priority, reason, s.now()); err != nil {
+			return err
+		}
+		if err := m.UpdateCase(item); err != nil {
+			return err
+		}
+		event, err := domain.NewAuditEvent(
+			m.NextID("event"),
+			"case",
+			item.ID,
+			item.ID,
+			"case_priority_adjusted",
+			actor,
+			fmt.Sprintf("priority adjusted from %s to %s: %s", previous, item.Priority, reason),
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		m.AppendEvent(event)
+		result = s.caseResponse(m, item)
 		return nil
 	})
 	return result, err
@@ -282,7 +380,7 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			return err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
+		result = s.caseResponse(m, item)
 		return nil
 	})
 	return result, err
@@ -303,11 +401,12 @@ func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bo
 	return selected, found
 }
 
-func caseResponse(m *repository.Mutation, item domain.VerificationCase) contracts.CaseResponse {
+func (s *Service) caseResponse(m *repository.Mutation, item domain.VerificationCase) contracts.CaseResponse {
 	result := contracts.CaseResponse{
 		Case:         item,
 		Measurements: m.Measurements(item.ID),
 		Events:       m.Events(item.ID),
+		Queue:        s.queueView(domain.MeasurementQueue(m.AllCases()), item),
 	}
 	if seal, exists := m.Seal(item.ID); exists {
 		result.Seal = &seal
@@ -315,14 +414,26 @@ func caseResponse(m *repository.Mutation, item domain.VerificationCase) contract
 	return result
 }
 
-func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.VerificationCase) contracts.CaseResponse {
+func (s *Service) caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.VerificationCase) contracts.CaseResponse {
 	result := contracts.CaseResponse{
 		Case:         item,
 		Measurements: snapshot.Measurements(item.ID),
 		Events:       snapshot.Events(item.ID),
+		Queue:        s.queueView(domain.MeasurementQueue(snapshot.AllCases()), item),
 	}
 	if seal, exists := snapshot.Seal(item.ID); exists {
 		result.Seal = &seal
 	}
 	return result
+}
+
+func (s *Service) queueView(queue []domain.VerificationCase, item domain.VerificationCase) contracts.QueueView {
+	view := contracts.QueueView{
+		Overdue: item.IsOverdue(s.now()),
+		Size:    len(queue),
+	}
+	if position, ok := domain.QueuePosition(queue, item.ID); ok {
+		view.Position = position
+	}
+	return view
 }

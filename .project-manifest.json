@@ -155,6 +155,29 @@
         "contracts",
         "bootstrap"
       ]
+    },
+    {
+      "id": "measurement-queue",
+      "name": "Measurement queue",
+      "entry": "GET /cases/queue",
+      "steps": [
+        "register planned completion time and priority basis when opening a case",
+        "derive the deterministic queue order and overdue flags at read time",
+        "accept a measurement only for the case at the head of the queue",
+        "adjust priority through an audited append-only event"
+      ],
+      "success": "returns the ordered queue with overdue flags and keeps the head consistent with measured cases",
+      "failure": "returns queue_head_mismatch when a non-head case enters measurement",
+      "verification": "workflowcheck orders mixed-priority cases, flags an overdue case, blocks a non-head measurement, adjusts priority, and reopens a case without losing history",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
     }
   ],
   "complexity": {

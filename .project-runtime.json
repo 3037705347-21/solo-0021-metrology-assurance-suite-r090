@@ -30,6 +30,10 @@
     {
       "workflow_id": "seal-verification",
       "command": "go run ./cmd/workflowcheck --workflow seal-verification"
+    },
+    {
+      "workflow_id": "measurement-queue",
+      "command": "go run ./cmd/workflowcheck --workflow measurement-queue"
     }
   ]
 }

@@ -5,6 +5,11 @@ measurement assurance work. It registers devices, opens verification cases,
 records measurements, handles failed tolerance decisions, and seals traceable
 evidence records.
 
+Each case carries a planned completion time and a priority basis registered by
+the steward. The service derives a deterministic measurement queue from those
+attributes, flags overdue cases on reads, and accepts a measurement only for
+the case at the head of the queue.
+
 ## Run
 
 ```bash
@@ -22,6 +27,7 @@ go run ./cmd/workflowcheck --workflow open-verification-case
 go run ./cmd/workflowcheck --workflow record-measurement
 go run ./cmd/workflowcheck --workflow reopen-verification-case
 go run ./cmd/workflowcheck --workflow seal-verification
+go run ./cmd/workflowcheck --workflow measurement-queue
 ```
 
 The workflow runner starts a fresh in-process HTTP service and exercises the
@@ -37,11 +43,21 @@ or extend these smoke checks with red/green verification tests.
 - `POST /devices`
 - `GET /devices/{id}`
 - `POST /cases`
+- `GET /cases/queue`
 - `GET /cases/{id}`
 - `POST /cases/{id}/measurements`
 - `POST /cases/{id}/reopen`
+- `POST /cases/{id}/priority`
 - `POST /cases/{id}/seal`
 - `GET /cases/{id}/events`
+
+`POST /cases` requires `due_at` (RFC 3339 planned completion time),
+`priority` (`routine`, `expedited`, or `urgent`), and `priority_reason`.
+`GET /cases/queue` returns the derived processing order with overdue flags;
+`GET /cases/{id}` includes the same status under `queue`. A measurement is
+accepted only for the case at the head of the queue (`queue_head_mismatch`
+otherwise), and `POST /cases/{id}/priority` records a new priority basis
+without touching stored history.
 
 ## Layout
 

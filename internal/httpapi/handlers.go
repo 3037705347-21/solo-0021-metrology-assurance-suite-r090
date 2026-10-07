@@ -56,6 +56,15 @@ func (s *Server) caseView(writer http.ResponseWriter, request *http.Request) {
 	writeJSON(writer, http.StatusOK, view)
 }
 
+func (s *Server) measurementQueue(writer http.ResponseWriter, request *http.Request) {
+	view, err := s.service.MeasurementQueue(request.Context())
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, view)
+}
+
 func (s *Server) recordMeasurement(writer http.ResponseWriter, request *http.Request) {
 	input, err := decodeJSON[contracts.RecordMeasurementRequest](writer, request)
 	if err != nil {
@@ -77,6 +86,20 @@ func (s *Server) reopenCase(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	view, err := s.service.ReopenCase(request.Context(), request.PathValue("id"), input)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, view)
+}
+
+func (s *Server) adjustCasePriority(writer http.ResponseWriter, request *http.Request) {
+	input, err := decodeJSON[contracts.AdjustCasePriorityRequest](writer, request)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	view, err := s.service.AdjustCasePriority(request.Context(), request.PathValue("id"), input)
 	if err != nil {
 		writeError(writer, err)
 		return
